@@ -20,7 +20,9 @@ GCP_REGION = "asia-northeast3"
 GEMINI_MODEL = "gemini-2.5-flash"
 PHONE = "010-0000-9999"
 PASSWORD = "TestCapd2025!"
-TODAY = datetime.now(timezone.utc).astimezone(
+import os
+_date_override = os.environ.get("DATE_OVERRIDE")
+TODAY = _date_override if _date_override else datetime.now(timezone.utc).astimezone(
     __import__("zoneinfo").ZoneInfo("Asia/Seoul")
 ).date().isoformat()
 
@@ -50,20 +52,33 @@ def generate_ai_answers(ai_questions: list) -> dict:
         )
 
         prompt = (
-            "당신은 복막투석(CAPD)을 받고 있는 62세 남성 환자 김철수입니다.\n"
-            "오늘 상태를 구체적으로 설명하면:\n"
-            "- 오후부터 다리가 약간 무겁고 피로감이 있었음\n"
-            "- 식사는 밥 한 공기 정도 먹었고 입맛이 평소보다 조금 없었음\n"
-            "- 복부 통증이나 발열은 없었음\n"
-            "- 배액은 맑았고 혼탁하지 않았음\n"
-            "- 카테터 주변 불편감은 없었음\n"
-            "- 복약은 아침 약을 깜빡해서 점심에 먹었음\n"
-            "- 소변은 하루 3번 정도 나왔음\n"
-            "- 부종은 발목에 아주 약간 있는 것 같음\n\n"
-            "아래 질문 목록을 읽고 위 상태에 맞게 사실적으로 답변해주세요.\n"
+            "당신은 복막투석(CAPD)을 받고 있는 68세 남성 환자 박영수입니다.\n"
+            "\n"
+            "[환자 기본 정보]\n"
+            "- 진단: 당뇨성 신부전(ESRD), CAPD 시작 2년 6개월째\n"
+            "- 동반 질환: 제2형 당뇨(20년), 고혈압, 만성심부전(EF 45%)\n"
+            "- 체중: 최근 3개월간 68kg → 69.5kg으로 서서히 증가 중 (부종 의심)\n"
+            "- 혈압: 평소 135~155/85~95 범위로 조절 불안정\n"
+            "- 혈당: 공복 120~170으로 불안정, 인슐린 사용 중\n"
+            "- UF량: 6개월 전 700~800ml/day에서 현재 350~500ml/day로 서서히 감소 중\n"
+            "- 소변량: 하루 1~2회 소량 (잔여 신기능 거의 없음)\n"
+            "- 배액: 대체로 맑으나 가끔 약간 노르스름한 편\n"
+            "\n"
+            "[오늘 상태]\n"
+            f"- 오늘 날짜 기준으로 자연스럽게 변동이 있는 상태를 표현해주세요\n"
+            "- 양쪽 발목 부종이 어제보다 약간 심해진 느낌\n"
+            "- 오후에 숨이 약간 찬 느낌이 있었으나 심하지는 않음\n"
+            "- 식사는 반 공기 정도, 입맛이 전반적으로 없음\n"
+            "- 피로감이 있고 오후에 낮잠을 잠\n"
+            "- 아침 인슐린은 맞았으나 혈압약을 저녁에 깜빡함\n"
+            "- 투석 교환 시 배액이 평소보다 적게 나온 것 같아 신경 쓰임\n"
+            "- 카테터 삽입 부위는 이상 없음, 복부 통증·발열 없음\n"
+            "\n"
+            "아래 질문 목록을 읽고 위 환자 상태에 맞게 사실적으로 답변해주세요.\n"
             "규칙:\n"
-            "- question_type이 yes_no이면 질문을 꼼꼼히 읽고 상태에 맞게 'yes' 또는 'no'로만 답하세요\n"
-            "- short_text이면 1~2문장 한국어 구어체로 구체적으로 답하세요 (예: '오후에 좀 무거운 느낌이 있었어요')\n"
+            "- question_type이 yes_no이면 질문을 꼼꼼히 읽고 환자 상태에 맞게 'yes' 또는 'no'로만 답하세요\n"
+            "- short_text이면 1~2문장 한국어 구어체로 이 환자답게 구체적으로 답하세요\n"
+            "  (예: '어제보다 발목이 좀 더 부어있는 것 같아요', '배액이 좀 적게 나온 것 같아서 걱정이에요')\n"
             "- 반드시 JSON 배열만 반환하고 다른 텍스트는 절대 쓰지 마세요\n"
             '형식: [{"question_id": 숫자, "answer": "답변"}, ...]\n\n'
             f"질문 목록 (JSON):\n{questions_text}"
@@ -119,29 +134,33 @@ def main():
                 sys.exit(0)
 
     # 3. 투석 기록 draft 생성
+    # 환자 프로필: 68세 남성, 당뇨성 신부전, UF 감소 추세, 체중 증가, 혈압 불안정
     log("Step 3: 투석 기록 draft 생성")
-    sbp = random.randint(115, 145)
-    dbp = random.randint(70, 90)
+    sbp = random.randint(133, 158)
+    dbp = random.randint(83, 96)
     infusion_weight = 2000
     exchanges = []
     for i in range(1, 5):
-        drainage = random.randint(1900, 2400)
+        # UF 감소 추세 반영: 회차별 배액량 낮게 설정 (350~500ml/day 목표)
+        drainage = random.randint(2000, 2130)
         uf = drainage - infusion_weight
+        # 가끔 고농도 처방 사용 (UF 부족 대응)
+        concentration = random.choices([1.5, 2.5, 4.25], weights=[3, 5, 2])[0]
         exchanges.append({
             "session_number": i,
             "exchange_time": f"{6 + (i - 1) * 4:02d}:00",
             "drainage_volume": drainage,
-            "infusion_concentration": random.choice([1.5, 2.5]),
+            "infusion_concentration": concentration,
             "infusion_weight": infusion_weight,
             "ultrafiltration": uf,
         })
     total_uf = sum(e["ultrafiltration"] for e in exchanges)
     record_data = {
         "record_date": TODAY,
-        "weight": round(random.uniform(58.0, 65.0), 1),
+        "weight": round(random.uniform(68.8, 70.2), 1),   # 체중 증가 추세
         "blood_pressure": f"{sbp}/{dbp}",
-        "urine_count": random.randint(2, 6),
-        "fasting_blood_glucose": float(random.randint(90, 140)),
+        "urine_count": random.randint(1, 2),               # 잔여 신기능 거의 없음
+        "fasting_blood_glucose": float(random.randint(118, 172)),  # 혈당 불안정
         "total_ultrafiltration": float(total_uf),
         "turbid_peritoneal": False,
         "memo": f"자동 테스트 기록 ({TODAY})",
