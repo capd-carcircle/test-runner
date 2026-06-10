@@ -594,4 +594,17 @@ def main():
                 if result == "skip":
                     skip += 1
                 elif result:
-  
+                    ok += 1
+                else:
+                    fail += 1
+            except Exception as exc:
+                log(f"  [{phone}] 예외: {exc}")
+                fail += 1
+
+    log(f"\n=== 완료 === 성공={ok} 건너뜀={skip} 실패={fail} 전체={total}")
+    if fail > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
