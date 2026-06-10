@@ -437,6 +437,9 @@ def step_create_record(session, headers: dict, target_date: str, vitals: dict) -
             record_id = r2.json()[0]["id"]
             log(f"  [{target_date}] 기존 기록 재사용 (id={record_id})")
             return record_id
+    if r.status_code == 403 and "담당 의사" in r.text:
+        log(f"  [{target_date}] 기록 생성 건너뜀 (담당 의사 미지정): {r.text[:100]}")
+        return "skip"
     log(f"  [{target_date}] 기록 생성 실패: {r.status_code} {r.text[:200]}")
     return None
 
@@ -555,6 +558,8 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
     record_id = step_create_record(session, headers, target_date, vitals)
     if record_id is None:
         return False
+    if record_id == "skip":
+        return "skip"
 
     survey_id = step_submit_record(session, headers, record_id)
     if survey_id is None:
@@ -577,7 +582,7 @@ def main():
     log(f"=== CAPD 테스트 러너 v3 시작 ===")
     log(f"  환자: {len(phones)}명, 날짜: {dates[0]} ~ {dates[-1]} ({len(dates)}일)")
 
-    total = ok = fail = 0
+    total = ok = fail = skip = 0
 
     for target_date in dates:
         log(f"\n── {target_date} ──")
@@ -585,18 +590,8 @@ def main():
             total += 1
             log(f"  [{phone}] 시작")
             try:
-                if run_one(phone, password, target_date):
-                    ok += 1
-                else:
-                    fail += 1
-            except Exception as exc:
-                log(f"  [{phone}] 예외: {exc}")
-                fail += 1
-
-    log(f"\n=== 완료 === 성공={ok} 실패={fail} 전체={total}")
-    if fail > 0:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+                result = run_one(phone, password, target_date)
+                if result == "skip":
+                    skip += 1
+                elif result:
+  
