@@ -406,6 +406,7 @@ def step_submit_record(session, headers: dict, record_id: int) -> int | None:
     return -1
 
 
+
 def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -> None:
     if not unanswered:
         return
@@ -427,6 +428,49 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
     r = api_post(session, f"/api/v1/surveys/{record_id}/common",
                  json={"record_id": record_id, "responses": responses}, headers=headers)
     log(f"  공통 질문 {len(responses)}개 제출: {r.status_code}")
+
+
+def step_trigger_ai_via_sse(token: str, record_id: int, timeout: int = 120) -> list:
+    """
+    SSE 엔드포인트를 직접 호출해 AI 질문 생성 트리거 + 결과 수집.
+    생성된 질문 목록 반환 (실패 시 빈 리스트).
+    """
+    url = f"{BASE}/api/v1/surveys/{record_id}/ai-questions/stream"
+    questions = []
+    try:
+        with requests.get(url, params={"token": token}, stream=True, timeout=timeout) as r:
+            if r.status_code != 200:
+                log(f"  SSE 호출 실패: {r.status_code}")
+                return []
+            buffer = ""
+            event_type = "message"
+            for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+                buffer += chunk
+                while "\n\n" in buffer:
+                    event_block, buffer = buffer.split("\n\n", 1)
+                    lines = event_block.strip().splitlines()
+                    data_str = None
+                    for line in lines:
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+                    if event_type == "done":
+                        log(f"  SSE 완료 — AI 질문 {len(questions)}개 생성")
+                        return questions
+                    if data_str:
+                        try:
+                            q = json.loads(data_str)
+                            if "question_id" in q:
+                                questions.append(q)
+                        except Exception:
+                            pass
+                    event_type = "message"
+    except requests.exceptions.Timeout:
+        log(f"  SSE {timeout}s 타임아웃 — {len(questions)}개 수신")
+    except Exception as e:
+        log(f"  SSE 예외: {e}")
+    return questions
 
 
 def step_fill_ai(session, headers: dict, record_id: int, unanswered: list, persona: str) -> None:
@@ -552,11 +596,11 @@ def scan_patient(phone: str, password: str, dates: list[str]) -> list[dict]:
 
 # ── Phase 2: 작업 항목 실행 ──────────────────────────────────
 def execute_work_item(item: dict, password: str) -> bool:
-    phone  = item["phone"]
+    phone       = item["phone"]
     target_date = item["date"]
-    profile = PATIENT_PROFILES.get(phone, DEFAULT_PROFILE)
-    persona = profile["persona"]
-    vitals  = profile["vitals"]
+    profile     = PATIENT_PROFILES.get(phone, DEFAULT_PROFILE)
+    persona     = profile["persona"]
+    vitals      = profile["vitals"]
 
     session = requests.Session()
     token = step_login(session, phone, password)
@@ -564,60 +608,45 @@ def execute_work_item(item: dict, password: str) -> bool:
         return False
     headers = {"Authorization": f"Bearer {token}"}
 
-    if item["type"] == "new":
-        # 신규 기록 생성
+    # 1. 기록 없으면 생성
+    record_id, status = step_get_existing(session, headers, target_date)
+    if record_id is None:
         record_id = step_create_record(session, headers, target_date, vitals)
         if record_id is None:
             return False
         if record_id == "skip":
             return True
+        status = "draft"
 
-        survey_id = step_submit_record(session, headers, record_id)
-        if survey_id is None:
+    # 2. draft면 제출
+    if status == "draft":
+        sid = step_submit_record(session, headers, record_id)
+        if sid is None:
             return False
 
-        # 공통 질문 — 제출 직후 조회
-        state = step_get_survey_state(session, headers, record_id)
-        if state and state["unanswered_common"]:
-            step_fill_common(session, headers, record_id, state["unanswered_common"])
+    # 3. 공통 질문 — 미답변 답변
+    state = step_get_survey_state(session, headers, record_id)
+    if state and state["unanswered_common"]:
+        step_fill_common(session, headers, record_id, state["unanswered_common"])
 
-        # AI 질문 — 생성된 게 있으면 답변, 없으면 스킵 (폴링 없음)
-        state2 = step_get_survey_state(session, headers, record_id)
-        if state2 and state2["unanswered_ai"]:
-            step_fill_ai(session, headers, record_id, state2["unanswered_ai"], persona)
-
-        log(f"  ✅ [{phone}] {target_date} 신규 완료 (record={record_id})")
+    # 4. AI 질문 — 없으면 SSE로 생성, 있으면 미답변 답변
+    state = step_get_survey_state(session, headers, record_id)
+    if not state:
+        log(f"  ✅ [{phone}] {target_date} 완료 (record={record_id})")
         return True
 
-    else:  # fill
-        record_id      = item["record_id"]
-        status         = item["status"]
-        missing_common = item["missing_common"]
-        missing_ai     = item["missing_ai"]
+    if state["ai_total"] == 0:
+        log(f"  AI 질문 없음 → SSE 생성 트리거")
+        ai_questions = step_trigger_ai_via_sse(token, record_id)
+        unanswered_ai = [q for q in ai_questions
+                         if not q.get("existing_choice") and not q.get("existing_text_answer")]
+        if unanswered_ai:
+            step_fill_ai(session, headers, record_id, unanswered_ai, persona)
+    elif state["unanswered_ai"]:
+        step_fill_ai(session, headers, record_id, state["unanswered_ai"], persona)
 
-        # draft면 먼저 제출
-        if status == "draft":
-            survey_id = step_submit_record(session, headers, record_id)
-            if survey_id is None:
-                return False
-            # 제출 후 다시 조회 (공통 질문이 새로 생겼을 수 있음)
-            state = step_get_survey_state(session, headers, record_id)
-            if state:
-                missing_common = state["unanswered_common"]
-                missing_ai     = state["unanswered_ai"]
-
-        if missing_common:
-            step_fill_common(session, headers, record_id, missing_common)
-
-        ai_total = item.get("ai_total", len(missing_ai))
-        if missing_ai:
-            step_fill_ai(session, headers, record_id, missing_ai, persona)
-        elif ai_total == 0:
-            log(f"  AI 질문 미생성 — 스킵")
-
-        log(f"  ✅ [{phone}] {target_date} 보충 완료 (record={record_id},"
-            f" common={len(missing_common)}, ai={len(missing_ai)})")
-        return True
+    log(f"  ✅ [{phone}] {target_date} 완료 (record={record_id})")
+    return True
 
 
 # ── 사전 로그인 검증 ─────────────────────────────────────────
