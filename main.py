@@ -1,9 +1,8 @@
 """
-CAPD 자동 테스트 러너 v4
-- 기본: DB의 모든 환자에 대해 오늘 날짜 기록 생성
-- 백필: BACKFILL_START / BACKFILL_END 환경변수로 날짜 범위 지정
-- 환자별 임상 프로필 적용 (수치 범위 + Gemini 답변 프롬프트)
-- 쿼터 보호: ThreadPoolExecutor 병렬처리 + Gemini 세마포어 + 지수 백오프
+CAPD 자동 테스트 러너 v5
+전략: 2단계 처리
+  Phase 1 (스캔): 환자별 1회 로그인 → 날짜 범위 전체 기록 조회 → 작업 목록 생성
+  Phase 2 (실행): 작업 목록만 처리 — 이미 완료된 건 건드리지 않음
 """
 
 import json
@@ -12,9 +11,7 @@ import os
 import random
 import re
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -33,17 +30,8 @@ BACKFILL_START = os.environ.get("BACKFILL_START", "").strip()
 BACKFILL_END   = os.environ.get("BACKFILL_END",   "").strip()
 DATE_OVERRIDE  = os.environ.get("DATE_OVERRIDE",  "").strip()
 
-# 동시 환자 처리 수 (기본 5) — 늘릴수록 빠르지만 백엔드 부하 증가
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "5"))
-# Gemini 동시 호출 제한 — RPM 보호 (기본 3)
-GEMINI_CONCURRENCY = int(os.environ.get("GEMINI_CONCURRENCY", "3"))
-# Gemini 재시도 최대 횟수
 GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "4"))
 
-# Gemini 동시 호출 세마포어 (모듈 레벨 공유)
-_gemini_sem = threading.Semaphore(GEMINI_CONCURRENCY)
-
-# ── KST 오늘 날짜 ────────────────────────────────────────────
 KST = ZoneInfo("Asia/Seoul")
 
 def _resolve_today() -> str:
@@ -57,7 +45,6 @@ def _resolve_today() -> str:
 
 TODAY = _resolve_today()
 
-# ── 로거 ────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 def log(msg: str) -> None:
@@ -65,8 +52,6 @@ def log(msg: str) -> None:
 
 
 # ── 환자별 임상 프로필 ────────────────────────────────────────
-# vitals: 수치 생성 범위
-# persona: Gemini 프롬프트용 환자 설명
 PATIENT_PROFILES = {
     "01000000001": {
         "vitals": {
@@ -78,11 +63,8 @@ PATIENT_PROFILES = {
         "persona": (
             "당신은 68세 남성 박영수입니다. 당뇨성 신부전으로 CAPD 2년 6개월째입니다.\n"
             "동반질환: 제2형 당뇨(20년), 고혈압, 만성심부전(EF 45%).\n"
-            "UF량이 6개월 전 700~800ml에서 현재 350~500ml로 감소 중 (membrane 기능 저하 의심).\n"
-            "체중이 3개월간 68→69.5kg으로 서서히 증가, 발목 부종 간헐적으로 있음.\n"
-            "혈압 135~155/85~95로 불안정, 혈당 공복 120~170으로 인슐린 사용 중.\n"
-            "오늘 상태: 발목 부종 어제보다 약간 심함, 오후 숨참 경미, 배액이 평소보다 적게 나온 느낌, "
-            "아침 인슐린은 맞았으나 저녁 혈압약 깜빡, 피로감으로 낮잠."
+            "UF량이 6개월 전 700~800ml에서 현재 350~500ml로 감소 중.\n"
+            "오늘 상태: 발목 부종 약간, 오후 숨참 경미, 배액이 평소보다 적게 나온 느낌, 피로감."
         ),
     },
     "01000000002": {
@@ -94,10 +76,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 55세 여성 이미경입니다. 사구체신염으로 CAPD 1년 3개월째입니다.\n"
-            "복막염 과거력 있음 (8개월 전 1회). 배액이 가끔 약간 혼탁하게 보여 걱정됨.\n"
-            "혈압은 비교적 잘 조절되고 있으나 카테터 삽입 부위에 간헐적으로 가려움이 있음.\n"
-            "오늘 상태: 배액 색이 평소보다 살짝 뿌연 것 같아 불안, 복부 통증은 없음, "
-            "카테터 주변 약간 가려움, 발열 없음, 식사는 잘 함."
+            "복막염 과거력 있음. 배액이 가끔 약간 혼탁하게 보여 걱정됨.\n"
+            "오늘 상태: 배액 색이 평소보다 살짝 뿌연 것 같아 불안, 카테터 주변 약간 가려움."
         ),
     },
     "01000000003": {
@@ -109,10 +89,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 72세 남성 최병국입니다. 고혈압성 신부전으로 CAPD 3년째입니다.\n"
-            "체액 과부하 경향 있어 고농도 투석액 자주 사용. 체중이 계속 높은 편.\n"
-            "혈압 조절이 어려워 항고혈압제 3종 복용 중이나 수축기 150 이상인 날이 많음.\n"
-            "오늘 상태: 아침 혈압이 168/98로 높게 나옴, 두통 경미하게 있음, "
-            "다리가 무거운 느낌, 약은 모두 복용함."
+            "혈압 조절이 어려워 항고혈압제 3종 복용 중.\n"
+            "오늘 상태: 아침 혈압 168/98, 두통 경미, 다리가 무거운 느낌."
         ),
     },
     "01000000004": {
@@ -124,11 +102,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 45세 여성 정수연입니다. IgA 신병증으로 CAPD 8개월째입니다.\n"
-            "잔여 신기능이 아직 일부 남아있어 소변량이 하루 300~500ml 정도 나옴.\n"
-            "최근 3개월간 체중이 49→47kg으로 감소 중, 식욕 부진이 주요 문제.\n"
-            "혈압과 혈당은 비교적 양호하게 유지됨.\n"
-            "오늘 상태: 아침부터 속이 메슥거리고 밥을 거의 못 먹음, "
-            "체중이 또 줄어있어 걱정, 투석은 정상적으로 함, 피로감 있음."
+            "최근 체중이 49→47kg으로 감소 중, 식욕 부진.\n"
+            "오늘 상태: 아침부터 속이 메슥거리고 밥을 거의 못 먹음, 체중 또 줄어있어 걱정."
         ),
     },
     "01000000005": {
@@ -140,10 +115,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 63세 남성 강동원입니다. 당뇨성 신부전으로 CAPD 2년째입니다.\n"
-            "만성심부전(EF 40%) 동반으로 체액 관리가 매우 중요함.\n"
-            "UF는 적절하게 나오고 있으나 심부전으로 인한 호흡곤란이 간헐적으로 발생.\n"
-            "오늘 상태: 오후에 계단 오를 때 숨이 많이 차서 멈춰야 했음, "
-            "누우면 숨쉬기가 편함, 발목 부종 약간, 가슴 답답함 경미하게 있음."
+            "만성심부전(EF 40%) 동반, 체액 관리 매우 중요.\n"
+            "오늘 상태: 계단 오를 때 숨이 많이 차서 멈춰야 했음, 발목 부종 약간."
         ),
     },
     "01000000006": {
@@ -154,11 +127,9 @@ PATIENT_PROFILES = {
             "concentrations": ([1.5, 2.5], [7, 3]),
         },
         "persona": (
-            "당신은 58세 여성 한지영입니다. 혈액투석에서 복막투석으로 전환한 지 5개월됐습니다.\n"
-            "잔여 신기능이 상당히 남아있어 소변이 하루 600~900ml씩 나옴.\n"
-            "복막투석에 아직 적응 중이며 교환 과정이 익숙하지 않은 부분이 있음.\n"
-            "오늘 상태: 투석 교환 시 배액 연결 과정에서 실수가 있었던 것 같아 불안, "
-            "배액은 맑고 양은 정상, 복부 이상 없음, 전반적으로 컨디션 양호."
+            "당신은 58세 여성 한지영입니다. 혈액투석에서 복막투석으로 전환 5개월됐습니다.\n"
+            "복막투석에 아직 적응 중.\n"
+            "오늘 상태: 교환 과정에서 실수가 있었던 것 같아 불안, 배액은 맑고 양 정상."
         ),
     },
     "01000000007": {
@@ -170,10 +141,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 70세 남성 송기태입니다. 고혈압성 신부전으로 CAPD 4년째입니다.\n"
-            "약 복용을 자주 잊어버리는 편이고 식이 제한을 잘 지키지 않음 (짠 음식 선호).\n"
-            "혈압이 전반적으로 높게 유지되고 있으며 체중도 목표보다 높음.\n"
-            "오늘 상태: 어제 저녁과 오늘 아침 혈압약을 둘 다 깜빡함, "
-            "혈압이 아침에 172/102로 매우 높게 나옴, 두통 있음, 어제 저녁 삼겹살 먹음."
+            "약 복용을 자주 잊어버리고 식이 제한을 잘 지키지 않음.\n"
+            "오늘 상태: 어제 저녁과 오늘 아침 혈압약 둘 다 깜빡, 혈압 172/102, 두통."
         ),
     },
     "01000000008": {
@@ -185,10 +154,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 52세 여성 윤서희입니다. 사구체신염으로 CAPD 1년째입니다.\n"
-            "혈압, 혈당 모두 양호하게 조절되고 있으며 UF도 충분히 나오는 편.\n"
-            "잔여 신기능도 일부 남아있어 전반적으로 상태가 안정적임.\n"
-            "오늘 상태: 전반적으로 컨디션 좋음, 투석도 원활하게 완료, "
-            "다만 오늘 직장 스트레스로 피로감이 약간 있음, 식사는 잘 함."
+            "혈압, 혈당 모두 양호하게 조절, 전반적으로 상태 안정적.\n"
+            "오늘 상태: 전반적으로 컨디션 좋음, 직장 스트레스로 피로감 약간."
         ),
     },
     "01000000009": {
@@ -200,10 +167,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 66세 남성 임재호입니다. 당뇨성 신부전으로 CAPD 1년 8개월째입니다.\n"
-            "카테터 삽입 부위 주변에 간헐적으로 발적과 분비물이 생기는 경향이 있음.\n"
-            "출구 감염 위험이 있어 주기적으로 모니터링 중.\n"
-            "오늘 상태: 카테터 삽입 부위가 어제부터 약간 빨개지고 누르면 아픔, "
-            "분비물은 없고 발열도 없음, 투석 배액은 맑음, 걱정이 됨."
+            "카테터 삽입 부위 주변에 간헐적으로 발적과 분비물 경향.\n"
+            "오늘 상태: 카테터 부위가 어제부터 약간 빨개지고 누르면 아픔, 걱정됨."
         ),
     },
     "01000000010": {
@@ -215,10 +180,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 60세 여성 오미란입니다. 다낭성 신장으로 CAPD 2년 2개월째입니다.\n"
-            "전반적으로 상태가 안정적이며 혈압과 혈당 조절이 잘 되고 있음.\n"
-            "체중도 목표 범위에서 유지되고 있고 UF도 충분히 나오는 편.\n"
-            "오늘 상태: 전반적으로 컨디션 양호, 투석 순조롭게 완료, "
-            "다만 무릎 관절통이 있어 오후에 파스 붙임, 식사 잘 함."
+            "전반적으로 상태가 안정적, 혈압과 혈당 조절 잘 됨.\n"
+            "오늘 상태: 전반적으로 컨디션 양호, 무릎 관절통 있어 파스 붙임."
         ),
     },
     "01033334444": {
@@ -230,10 +193,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 75세 남성 노인환자입니다. 고혈압성 신부전으로 CAPD 3년 6개월째입니다.\n"
-            "경도 인지장애가 있어 투석과 복약을 가족(아내)의 도움을 받아 진행함.\n"
-            "약을 가끔 더블로 먹거나 빠뜨리는 일이 있음. 식이 제한 인식이 부족함.\n"
-            "오늘 상태: 아내가 오늘 외출해서 혼자 투석을 진행했고 잘 됐는지 불안, "
-            "약을 아침에 먹었는지 기억이 잘 안 남, 식사는 라면을 먹음, 전반적으로 피곤함."
+            "경도 인지장애, 투석과 복약을 가족 도움으로 진행.\n"
+            "오늘 상태: 아내가 외출해서 혼자 투석, 약을 먹었는지 기억 안 남, 라면 먹음."
         ),
     },
     "01044559234": {
@@ -245,11 +206,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 48세 여성 직장인입니다. IgA 신병증으로 CAPD 10개월째입니다.\n"
-            "낮에는 직장에 다니고 야간에 투석을 주로 진행하는 CAPD 방식 적용 중.\n"
-            "직장 스트레스로 혈압이 오르는 경향이 있고 수면이 부족한 편.\n"
-            "오늘 상태: 오늘 업무가 많아서 야간 교환이 늦어짐, "
-            "피로감이 심하고 두통 약간 있음, 혈압이 평소보다 높게 측정됨, "
-            "식사는 점심을 편의점 도시락으로 해결."
+            "낮에 직장, 야간에 투석하는 방식. 직장 스트레스로 혈압 오르는 경향.\n"
+            "오늘 상태: 업무 많아 야간 교환 늦어짐, 피로 심하고 두통 약간, 점심 편의점 도시락."
         ),
     },
     "01011223344": {
@@ -261,10 +219,8 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 61세 남성입니다. 당뇨성 신부전으로 CAPD 2년 9개월째입니다.\n"
-            "당뇨 합병증이 심각해 시력이 저하되어 있고 말초신경병증으로 발 감각이 둔함.\n"
-            "혈당 조절이 매우 어렵고 인슐린 용량 조절이 자주 필요함.\n"
-            "오늘 상태: 공복 혈당이 198로 높게 나옴, 인슐린을 평소보다 많이 맞았음, "
-            "발 저림이 오늘 유독 심함, 눈이 흐릿한 느낌, 식사는 했으나 단 것을 먹은 것 같음."
+            "시력 저하, 말초신경병증으로 발 감각 둔함. 혈당 조절 매우 어려움.\n"
+            "오늘 상태: 공복 혈당 198, 인슐린 평소보다 많이 맞음, 발 저림 심함."
         ),
     },
     "010-0000-9999": {
@@ -276,11 +232,7 @@ PATIENT_PROFILES = {
         },
         "persona": (
             "당신은 68세 남성 박영수입니다. 당뇨성 신부전으로 CAPD 2년 6개월째입니다.\n"
-            "동반질환: 제2형 당뇨(20년), 고혈압, 만성심부전(EF 45%).\n"
-            "UF량이 6개월 전 700~800ml에서 현재 350~500ml로 감소 중 (membrane 기능 저하 의심).\n"
-            "체중이 3개월간 68→69.5kg으로 서서히 증가, 발목 부종 간헐적으로 있음.\n"
-            "오늘 상태: 발목 부종 어제보다 약간 심함, 배액이 평소보다 적게 나온 느낌, "
-            "피로감으로 낮잠, 저녁 혈압약 깜빡."
+            "오늘 상태: 발목 부종 약간, 배액이 평소보다 적게 나온 느낌, 저녁 혈압약 깜빡."
         ),
     },
 }
@@ -321,7 +273,7 @@ def get_all_patient_phones() -> list[str]:
         log("DATABASE_URL 미설정 — PATIENT_PROFILES 키 목록 사용")
         return list(PATIENT_PROFILES.keys())
     try:
-        import psycopg2  # type: ignore
+        import psycopg2
         conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor()
         cur.execute(
@@ -349,7 +301,7 @@ def api_post(session, path, **kwargs):
     return session.post(f"{BASE}{path}", **kwargs)
 
 
-# ── Gemini 답변 생성 (지수 백오프 재시도) ────────────────────
+# ── Gemini 답변 생성 ─────────────────────────────────────────
 def generate_ai_answers(ai_questions: list, persona: str) -> dict:
     if not ai_questions:
         return {}
@@ -376,42 +328,39 @@ def generate_ai_answers(ai_questions: list, persona: str) -> dict:
         f"질문 목록:\n{questions_text}"
     )
 
-    with _gemini_sem:  # 동시 Gemini 호출 제한
-        for attempt in range(GEMINI_MAX_RETRIES):
-            try:
-                response = model.generate_content(prompt)
-                raw = response.text.strip()
-                match = re.search(r"\[.*\]", raw, re.DOTALL)
-                if not match:
-                    return {}
-                parsed = json.loads(match.group())
-                return {str(item["question_id"]): str(item["answer"])
-                        for item in parsed if "question_id" in item and "answer" in item}
-            except Exception as e:
-                err_str = str(e)
-                # 429 ResourceExhausted / 503 Unavailable → 재시도
-                if any(code in err_str for code in ("429", "503", "ResourceExhausted", "RESOURCE_EXHAUSTED")):
-                    wait = (2 ** attempt) * 10 + random.uniform(0, 3)  # 10s, 20s, 40s, 80s
-                    log(f"  Gemini 쿼터 초과 (시도 {attempt+1}/{GEMINI_MAX_RETRIES}) — {wait:.0f}초 대기")
-                    time.sleep(wait)
-                else:
-                    log(f"  Gemini 실패 (fallback): {e}")
-                    return {}
-        log("  Gemini 최대 재시도 초과 — fallback 반환")
-        return {}
+    for attempt in range(GEMINI_MAX_RETRIES):
+        try:
+            response = model.generate_content(prompt)
+            raw = response.text.strip()
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if not match:
+                return {}
+            parsed = json.loads(match.group())
+            return {str(item["question_id"]): str(item["answer"])
+                    for item in parsed if "question_id" in item and "answer" in item}
+        except Exception as e:
+            err_str = str(e)
+            if any(code in err_str for code in ("429", "503", "ResourceExhausted", "RESOURCE_EXHAUSTED")):
+                wait = (2 ** attempt) * 10 + random.uniform(0, 3)
+                log(f"  Gemini 쿼터 초과 (시도 {attempt+1}/{GEMINI_MAX_RETRIES}) — {wait:.0f}초 대기")
+                time.sleep(wait)
+            else:
+                log(f"  Gemini 실패: {e}")
+                return {}
+    log("  Gemini 최대 재시도 초과")
+    return {}
 
 
-# ── 단계별 함수 ──────────────────────────────────────────────
+# ── 단계 함수 ────────────────────────────────────────────────
 def step_login(session, phone: str, password: str) -> str | None:
     r = api_post(session, "/api/v1/auth/login", json={"phone_number": phone, "password": password})
     if r.status_code != 200:
-        log(f"  로그인 실패 ({phone}): {r.status_code} {r.text[:200]}")
+        log(f"  로그인 실패 ({phone}): {r.status_code}")
         return None
     return r.json()["access_token"]
 
 
-def step_get_existing(session, headers: dict, target_date: str) -> tuple[int | None, str | None]:
-    """기존 기록 반환 (record_id, status). 없으면 (None, None)"""
+def step_get_existing(session, headers: dict, target_date: str) -> tuple:
     r = api_get(session, f"/api/v1/records?date={target_date}", headers=headers)
     if r.status_code == 200:
         existing = r.json()
@@ -421,15 +370,39 @@ def step_get_existing(session, headers: dict, target_date: str) -> tuple[int | N
     return None, None
 
 
-def step_get_unanswered(session, headers: dict, record_id: int) -> tuple[list, list]:
-    """미답변 공통질문, 미답변 AI질문 반환"""
+def step_get_survey_state(session, headers: dict, record_id: int) -> dict:
+    """survey 상태 반환: {common_total, common_answered, ai_total, ai_answered, unanswered_common, unanswered_ai}"""
     r = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
     if r.status_code != 200:
-        return [], []
+        return {}
     data = r.json()
-    unanswered_common = [q for q in data.get("common_questions", []) if not q.get("answered")]
-    unanswered_ai    = [q for q in data.get("ai_questions", [])     if not q.get("answered")]
-    return unanswered_common, unanswered_ai
+    common_qs = data.get("common_questions", [])
+    ai_qs     = data.get("ai_questions", [])
+    return {
+        "common_total":     len(common_qs),
+        "common_answered":  sum(1 for q in common_qs if q.get("answered")),
+        "ai_total":         len(ai_qs),
+        "ai_answered":      sum(1 for q in ai_qs if q.get("answered")),
+        "unanswered_common": [q for q in common_qs if not q.get("answered")],
+        "unanswered_ai":     [q for q in ai_qs     if not q.get("answered")],
+    }
+
+
+def step_submit_record(session, headers: dict, record_id: int) -> int | None:
+    r = api_post(session, f"/api/v1/records/{record_id}/submit", headers=headers)
+    if r.status_code == 200:
+        body = r.json()
+        sid = body.get("survey_id") or body.get("id")
+        if sid:
+            return sid
+    elif r.status_code != 409:
+        log(f"  제출 실패: {r.status_code} {r.text[:200]}")
+        return None
+    # 409 또는 sid 없음 → 조회
+    r2 = api_get(session, f"/api/v1/surveys?record_id={record_id}", headers=headers)
+    if r2.status_code == 200 and r2.json():
+        return r2.json()[0]["id"]
+    return None
 
 
 def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -> None:
@@ -442,12 +415,14 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
         text = q.get("question_text", "")
         if qt == "yes_no":
             choice = "yes" if any(kw in text for kw in YES_KEYWORDS) else "no"
-            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": choice, "text_answer": ""})
+            responses.append({"question_id": q["question_id"], "question_type": "common",
+                               "choice": choice, "text_answer": ""})
         else:
-            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": None, "text_answer": "특이사항 없음"})
+            responses.append({"question_id": q["question_id"], "question_type": "common",
+                               "choice": None, "text_answer": "특이사항 없음"})
     r = api_post(session, f"/api/v1/surveys/{record_id}/common",
                  json={"record_id": record_id, "responses": responses}, headers=headers)
-    log(f"  공통 질문 보충 {len(responses)}개: {r.status_code}")
+    log(f"  공통 질문 {len(responses)}개 제출: {r.status_code}")
 
 
 def step_fill_ai(session, headers: dict, record_id: int, unanswered: list, persona: str) -> None:
@@ -461,23 +436,25 @@ def step_fill_ai(session, headers: dict, record_id: int, unanswered: list, perso
         ans = gemini_answers.get(str(qid))
         if qt == "yes_no":
             choice = ans if ans in ("yes", "no") else "no"
-            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": choice, "text_answer": ""})
+            ai_responses.append({"question_id": qid, "question_type": "ai",
+                                  "choice": choice, "text_answer": ""})
         else:
-            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": None,
-                                  "text_answer": ans if ans else "특별한 증상 없이 평소와 비슷합니다."})
+            ai_responses.append({"question_id": qid, "question_type": "ai",
+                                  "choice": None,
+                                  "text_answer": ans or "특별한 증상 없이 평소와 비슷합니다."})
     r = api_post(session, f"/api/v1/surveys/{record_id}/ai",
                  json={"record_id": record_id, "responses": ai_responses}, headers=headers)
-    log(f"  AI 답변 보충 {len(ai_responses)}개: {r.status_code}")
+    log(f"  AI 답변 {len(ai_responses)}개 제출: {r.status_code}")
 
 
-def step_create_record(session, headers: dict, target_date: str, vitals: dict) -> int | None:
+def step_create_record(session, headers: dict, target_date: str, vitals: dict) -> int | None | str:
     sbp = random.randint(*vitals["sbp"])
     dbp = random.randint(*vitals["dbp"])
     conc_list, conc_weights = vitals["concentrations"]
     infusion_weight = 2000
     exchanges = []
     for i in range(1, 5):
-        drainage     = random.randint(*vitals["drainage"])
+        drainage      = random.randint(*vitals["drainage"])
         concentration = random.choices(conc_list, weights=conc_weights)[0]
         exchanges.append({
             "session_number": i,
@@ -487,14 +464,13 @@ def step_create_record(session, headers: dict, target_date: str, vitals: dict) -
             "infusion_weight": infusion_weight,
             "ultrafiltration": drainage - infusion_weight,
         })
-    total_uf = sum(e["ultrafiltration"] for e in exchanges)
     record_data = {
         "record_date": target_date,
         "weight": round(random.uniform(*vitals["weight"]), 1),
         "blood_pressure": f"{sbp}/{dbp}",
         "urine_count": random.randint(*vitals["urine"]),
         "fasting_blood_glucose": float(random.randint(*vitals["glucose"])),
-        "total_ultrafiltration": float(total_uf),
+        "total_ultrafiltration": float(sum(e["ultrafiltration"] for e in exchanges)),
         "turbid_peritoneal": False,
         "memo": f"자동 테스트 기록 ({target_date})",
         "exchange_records": exchanges,
@@ -511,56 +487,15 @@ def step_create_record(session, headers: dict, target_date: str, vitals: dict) -
             log(f"  [{target_date}] 기존 기록 재사용 (id={record_id})")
             return record_id
     if r.status_code == 403 and "담당 의사" in r.text:
-        log(f"  [{target_date}] 기록 생성 건너뜀 (담당 의사 미지정): {r.text[:100]}")
+        log(f"  [{target_date}] 담당 의사 미지정 — 스킵")
         return "skip"
     log(f"  [{target_date}] 기록 생성 실패: {r.status_code} {r.text[:200]}")
     return None
 
 
-def step_submit_record(session, headers: dict, record_id: int) -> int | None:
-    r = api_post(session, f"/api/v1/records/{record_id}/submit", headers=headers)
-    survey_id = None
-    if r.status_code == 200:
-        body = r.json()
-        survey_id = body.get("survey_id") or body.get("id")
-    elif r.status_code != 409:
-        log(f"  제출 실패: {r.status_code} {r.text[:200]}")
-        return None
-    if not survey_id:
-        r2 = api_get(session, f"/api/v1/surveys?record_id={record_id}", headers=headers)
-        if r2.status_code == 200 and r2.json():
-            survey_id = r2.json()[0]["id"]
-        else:
-            log(f"  survey_id 조회 실패: {r2.status_code}")
-            return None
-    return survey_id
-
-
-def step_common_questions(session, headers: dict, record_id: int) -> None:
-    r = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
-    if r.status_code != 200:
-        return
-    common_qs = r.json().get("common_questions", [])
-    if not common_qs:
-        return
-    YES_KEYWORDS = ["처방약", "약을 복용", "약 복용", "복약"]
-    responses = []
-    for q in common_qs:
-        qt   = q.get("question_type", "short_text")
-        text = q.get("question_text", "")
-        if qt == "yes_no":
-            choice = "yes" if any(kw in text for kw in YES_KEYWORDS) else "no"
-            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": choice, "text_answer": ""})
-        else:
-            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": None, "text_answer": "특이사항 없음"})
-    r2 = api_post(session, f"/api/v1/surveys/{record_id}/common",
-                  json={"record_id": record_id, "responses": responses}, headers=headers)
-    log(f"  공통 질문 {len(responses)}개 제출: {r2.status_code}")
-
-
 def step_poll_ai_questions(session, headers: dict, record_id: int,
-                           poll_interval: int = 5, max_wait: int = 180) -> list:
-    """SSE 대신 폴링으로 AI 질문 대기 — 짧은 커넥션 반복, 타임아웃 없음"""
+                           poll_interval: int = 5, max_wait: int = 90) -> list:
+    """신규 기록 전용 — AI 질문 생성 대기 (최대 90s)"""
     deadline = time.time() + max_wait
     prev_count = 0
     while time.time() < deadline:
@@ -568,138 +503,164 @@ def step_poll_ai_questions(session, headers: dict, record_id: int,
         if r.status_code != 200:
             time.sleep(poll_interval)
             continue
-        data = r.json()
-        ai_qs = data.get("ai_questions", [])
-        # 생성 완료 판단: 질문이 1개 이상 생겼고, 이전 폴링과 개수 동일 (더 이상 안 늘어남)
+        ai_qs = r.json().get("ai_questions", [])
         if len(ai_qs) > 0 and len(ai_qs) == prev_count:
-            log(f"  AI 질문 {len(ai_qs)}개 확인 (폴링)")
+            log(f"  AI 질문 {len(ai_qs)}개 생성 확인")
             return ai_qs
         prev_count = len(ai_qs)
         time.sleep(poll_interval)
-    log(f"  AI 질문 폴링 타임아웃 ({max_wait}s) — 현재 {prev_count}개")
+    log(f"  AI 질문 폴링 {max_wait}s 타임아웃 — {prev_count}개")
     return []
 
 
-def step_submit_ai_answers(session, headers: dict, record_id: int, ai_questions: list, persona: str) -> None:
-    if not ai_questions:
-        log("  AI 질문 없음 — 생략")
-        return
-    gemini_answers = generate_ai_answers(ai_questions, persona)
-    log(f"  Gemini 답변: {len(gemini_answers)}개")
-    ai_responses = []
-    for q in ai_questions:
-        qt  = q.get("question_type", "short_text")
-        qid = q.get("question_id") or q.get("id")
-        ans = gemini_answers.get(str(qid))
-        if qt == "yes_no":
-            choice = ans if ans in ("yes", "no") else "no"
-            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": choice, "text_answer": ""})
-        else:
-            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": None,
-                                  "text_answer": ans if ans else "특별한 증상 없이 평소와 비슷합니다."})
-    r = api_post(session, f"/api/v1/surveys/{record_id}/ai",
-                 json={"record_id": record_id, "responses": ai_responses}, headers=headers)
-    log(f"  AI 답변 제출: {r.status_code}")
-
-
-# ── 환자 1명 × 날짜 1일 ──────────────────────────────────────
-def run_one(phone: str, password: str, target_date: str) -> bool:
+# ── Phase 1: 환자별 스캔 ─────────────────────────────────────
+def scan_patient(phone: str, password: str, dates: list[str]) -> list[dict]:
+    """
+    환자 1명 로그인 → 전체 날짜 스캔 → 작업 필요한 항목만 반환
+    반환 형식:
+      {"type": "new",  "phone": ..., "date": ...}
+      {"type": "fill", "phone": ..., "date": ..., "record_id": ..., "status": ...,
+       "missing_common": [...], "missing_ai": [...]}
+    """
     profile = PATIENT_PROFILES.get(phone, DEFAULT_PROFILE)
-    vitals  = profile["vitals"]
+    session = requests.Session()
+    token = step_login(session, phone, password)
+    if not token:
+        return []
+    headers = {"Authorization": f"Bearer {token}"}
+
+    work = []
+    for target_date in dates:
+        record_id, status = step_get_existing(session, headers, target_date)
+
+        if status == "reviewed":
+            continue  # 완료 — 건너뜀
+
+        if record_id is None:
+            # 기록 자체 없음
+            work.append({"type": "new", "phone": phone, "date": target_date})
+            continue
+
+        # submitted / draft — survey 상태 확인
+        state = step_get_survey_state(session, headers, record_id)
+        if not state:
+            work.append({"type": "fill", "phone": phone, "date": target_date,
+                         "record_id": record_id, "status": status,
+                         "missing_common": [], "missing_ai": []})
+            continue
+
+        missing_common = state["unanswered_common"]
+        missing_ai     = state["unanswered_ai"]
+        ai_total       = state["ai_total"]
+
+        # draft이거나, 미답변 있거나, AI 질문이 아예 0개(미생성)이면 처리 필요
+        if status == "draft" or missing_common or missing_ai or ai_total == 0:
+            work.append({"type": "fill", "phone": phone, "date": target_date,
+                         "record_id": record_id, "status": status,
+                         "missing_common": missing_common, "missing_ai": missing_ai,
+                         "ai_total": ai_total})
+        # else: submitted + 전부 answered → 완료, 건너뜀
+
+    log(f"  [{phone}] 스캔 완료: {len(dates)}일 중 작업 필요 {len(work)}건")
+    return work
+
+
+# ── Phase 2: 작업 항목 실행 ──────────────────────────────────
+def execute_work_item(item: dict, password: str) -> bool:
+    phone  = item["phone"]
+    target_date = item["date"]
+    profile = PATIENT_PROFILES.get(phone, DEFAULT_PROFILE)
     persona = profile["persona"]
+    vitals  = profile["vitals"]
 
     session = requests.Session()
     token = step_login(session, phone, password)
     if not token:
-        return "skip"  # 로그인 실패 = 비밀번호 불일치 계정, 실패로 카운트 안 함
+        return False
     headers = {"Authorization": f"Bearer {token}"}
 
-    # ── 기존 기록 확인 ──
-    record_id, status = step_get_existing(session, headers, target_date)
+    if item["type"] == "new":
+        # 신규 기록 생성
+        record_id = step_create_record(session, headers, target_date, vitals)
+        if record_id is None:
+            return False
+        if record_id == "skip":
+            return True
 
-    if status == "reviewed":
-        log(f"  [{target_date}] 의사 검토 완료 — 스킵")
+        survey_id = step_submit_record(session, headers, record_id)
+        if survey_id is None:
+            return False
+
+        # 공통 질문 — 제출 직후 조회
+        state = step_get_survey_state(session, headers, record_id)
+        if state and state["unanswered_common"]:
+            step_fill_common(session, headers, record_id, state["unanswered_common"])
+
+        # AI 질문 — 신규이므로 폴링
+        ai_questions = step_poll_ai_questions(session, headers, record_id)
+        if ai_questions:
+            unanswered = [q for q in ai_questions if not q.get("answered")]
+            if unanswered:
+                step_fill_ai(session, headers, record_id, unanswered, persona)
+
+        log(f"  ✅ [{phone}] {target_date} 신규 완료 (record={record_id})")
         return True
 
-    if record_id and status in ("submitted", "draft"):
-        # 제출됐지만 survey 미완료일 수 있음 → 확인 후 보충
-        log(f"  [{target_date}] 기존 기록 있음 (id={record_id}, status={status}) — survey 확인")
+    else:  # fill
+        record_id      = item["record_id"]
+        status         = item["status"]
+        missing_common = item["missing_common"]
+        missing_ai     = item["missing_ai"]
 
         # draft면 먼저 제출
         if status == "draft":
             survey_id = step_submit_record(session, headers, record_id)
             if survey_id is None:
                 return False
+            # 제출 후 다시 조회 (공통 질문이 새로 생겼을 수 있음)
+            state = step_get_survey_state(session, headers, record_id)
+            if state:
+                missing_common = state["unanswered_common"]
+                missing_ai     = state["unanswered_ai"]
 
-        unanswered_common, unanswered_ai = step_get_unanswered(session, headers, record_id)
+        if missing_common:
+            step_fill_common(session, headers, record_id, missing_common)
 
-        # 공통 질문 보충
-        if unanswered_common:
-            step_fill_common(session, headers, record_id, unanswered_common)
+        ai_total = item.get("ai_total", len(missing_ai))
+        if missing_ai:
+            step_fill_ai(session, headers, record_id, missing_ai, persona)
+        elif ai_total == 0:
+            # AI 질문이 아예 없음 → submit 재호출로 백그라운드 생성 재트리거
+            log(f"  AI 질문 미생성 → submit 재호출로 재트리거")
+            api_post(session, f"/api/v1/records/{record_id}/submit", headers=headers)
+            # 폴링으로 생성 대기
+            ai_questions = step_poll_ai_questions(session, headers, record_id, max_wait=90)
+            if ai_questions:
+                unanswered = [q for q in ai_questions if not q.get("answered")]
+                if unanswered:
+                    step_fill_ai(session, headers, record_id, unanswered, persona)
+            else:
+                log(f"  AI 질문 생성 실패 — 기록 완료 처리")
 
-        # AI 질문 보충 — 이미 생성된 게 있으면 답변, 없으면 SSE로 대기
-        if unanswered_ai:
-            step_fill_ai(session, headers, record_id, unanswered_ai, persona)
-        elif not unanswered_ai:
-            # AI 질문 자체가 아예 없는 경우 SSE로 새로 받기
-            r_check = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
-            if r_check.status_code == 200:
-                total_ai = len(r_check.json().get("ai_questions", []))
-                if total_ai == 0:
-                    ai_questions = step_poll_ai_questions(session, headers, record_id)
-                    step_submit_ai_answers(session, headers, record_id, ai_questions, persona)
-
-        log(f"  ✅ 보충 완료 — record={record_id}")
+        log(f"  ✅ [{phone}] {target_date} 보충 완료 (record={record_id},"
+            f" common={len(missing_common)}, ai={len(missing_ai)})")
         return True
 
-    # ── 신규 기록 생성 ──
-    record_id = step_create_record(session, headers, target_date, vitals)
-    if record_id is None:
-        return False
-    if record_id == "skip":
-        return "skip"
 
-    survey_id = step_submit_record(session, headers, record_id)
-    if survey_id is None:
-        return False
-
-    step_common_questions(session, headers, record_id)
-    ai_questions = step_poll_ai_questions(session, headers, record_id)
-    step_submit_ai_answers(session, headers, record_id, ai_questions, persona)
-
-    log(f"  ✅ 완료 — record={record_id} survey={survey_id} AI질문={len(ai_questions)}개")
-    return True
-
-
-# ── 날짜 1일치 병렬 처리 ─────────────────────────────────────
-def run_date(target_date: str, phones: list, password: str) -> tuple[int, int, int]:
-    """(ok, skip, fail) 반환"""
-    ok = fail = skip = 0
-    lock = threading.Lock()
-
-    def _task(phone):
-        nonlocal ok, fail, skip
-        log(f"  [{phone}] 시작 ({target_date})")
-        try:
-            result = run_one(phone, password, target_date)
-            with lock:
-                if result == "skip":
-                    skip += 1
-                elif result:
-                    ok += 1
-                else:
-                    fail += 1
-        except Exception as exc:
-            log(f"  [{phone}] 예외: {exc}")
-            with lock:
-                fail += 1
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(_task, p): p for p in phones}
-        for f in as_completed(futures):
-            f.result()  # 예외 전파 방지 (이미 내부에서 처리)
-
-    return ok, skip, fail
+# ── 사전 로그인 검증 ─────────────────────────────────────────
+def preflight_login(phones: list, password: str) -> list:
+    log(f"\n=== 로그인 사전 검증 ({len(phones)}명) ===")
+    valid = []
+    for phone in phones:
+        session = requests.Session()
+        token = step_login(session, phone, password)
+        if token:
+            valid.append(phone)
+            log(f"  ✅ {phone}")
+        else:
+            log(f"  ❌ {phone} — 제외")
+    log(f"  → 유효 {len(valid)}명 / 제외 {len(phones)-len(valid)}명\n")
+    return valid
 
 
 # ── 메인 ────────────────────────────────────────────────────
@@ -708,22 +669,48 @@ def main():
     phones   = get_all_patient_phones()
     password = TEST_PASSWORD
 
-    log(f"=== CAPD 테스트 러너 v4 시작 ===")
-    log(f"  환자: {len(phones)}명 | 날짜: {dates[0]} ~ {dates[-1]} ({len(dates)}일)")
-    log(f"  병렬처리: MAX_WORKERS={MAX_WORKERS} | Gemini 동시제한: {GEMINI_CONCURRENCY}")
+    log(f"=== CAPD 테스트 러너 v5 시작 ===")
+    log(f"  전체 환자: {len(phones)}명 | 날짜: {dates[0]} ~ {dates[-1]} ({len(dates)}일)")
 
-    total = ok = fail = skip = 0
+    # ── Phase 0: 로그인 사전 검증 ──
+    phones = preflight_login(phones, password)
+    if not phones:
+        log("로그인 가능한 환자 없음 — 종료")
+        sys.exit(1)
 
-    for target_date in dates:
-        log(f"\n── {target_date} ──")
-        d_ok, d_skip, d_fail = run_date(target_date, phones, password)
-        ok   += d_ok
-        skip += d_skip
-        fail += d_fail
-        total += len(phones)
-        log(f"  [{target_date}] 완료 — 성공={d_ok} 스킵={d_skip} 실패={d_fail}")
+    # ── Phase 1: 전체 스캔 (직렬) ──
+    log(f"\n=== Phase 1: 전체 스캔 ({len(phones)}명 × {len(dates)}일) ===")
+    all_work: list[dict] = []
+    for phone in phones:
+        items = scan_patient(phone, password, dates)
+        all_work.extend(items)
 
-    log(f"\n=== 완료 === 성공={ok} 건너뜀={skip} 실패={fail} 전체={total}")
+    new_count  = sum(1 for w in all_work if w["type"] == "new")
+    fill_count = sum(1 for w in all_work if w["type"] == "fill")
+    done_count = len(phones) * len(dates) - new_count - fill_count
+    log(f"\n  스캔 결과: 신규={new_count}건 | 보충={fill_count}건 | 이미완료={done_count}건")
+
+    if not all_work:
+        log("모든 기록 완료 — 작업 없음")
+        return
+
+    # ── Phase 2: 실행 (직렬, 항목 간 2초 간격) ──
+    log(f"\n=== Phase 2: 실행 ({len(all_work)}건) ===")
+    ok = fail = 0
+    for i, item in enumerate(all_work, 1):
+        log(f"  [{i}/{len(all_work)}] {item['phone']} {item['date']} ({item['type']})")
+        try:
+            result = execute_work_item(item, password)
+            if result:
+                ok += 1
+            else:
+                fail += 1
+        except Exception as e:
+            log(f"  예외: {e}")
+            fail += 1
+        time.sleep(2)  # 백엔드/AI 서비스 부하 방지
+
+    log(f"\n=== 완료 === 성공={ok} 실패={fail} 전체={len(all_work)}")
     if fail > 0:
         sys.exit(1)
 
