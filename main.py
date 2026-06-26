@@ -558,37 +558,26 @@ def step_common_questions(session, headers: dict, record_id: int) -> None:
     log(f"  공통 질문 {len(responses)}개 제출: {r2.status_code}")
 
 
-def step_stream_ai_questions(session, token: str, record_id: int) -> list:
-    ai_questions = []
-    try:
-        with session.get(
-            f"{BASE}/api/v1/surveys/{record_id}/ai-questions/stream",
-            params={"token": token},
-            headers={"Accept": "text/event-stream"},
-            stream=True, timeout=120,
-        ) as resp:
-            if resp.status_code != 200:
-                log(f"  SSE 연결 실패: {resp.status_code}")
-                return []
-            for raw in resp.iter_lines():
-                line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-                if not line:
-                    continue
-                if line.startswith("event:") and line[6:].strip() == "done":
-                    break
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    obj = json.loads(line[5:].strip())
-                    if obj.get("question_id"):
-                        ai_questions.append(obj)
-                        log(f"  질문: {obj.get('question_text','')[:55]}")
-                except Exception:
-                    pass
-    except Exception as e:
-        log(f"  SSE 오류: {e}")
-    log(f"  AI 질문 {len(ai_questions)}개 수신")
-    return ai_questions
+def step_poll_ai_questions(session, headers: dict, record_id: int,
+                           poll_interval: int = 5, max_wait: int = 180) -> list:
+    """SSE 대신 폴링으로 AI 질문 대기 — 짧은 커넥션 반복, 타임아웃 없음"""
+    deadline = time.time() + max_wait
+    prev_count = 0
+    while time.time() < deadline:
+        r = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
+        if r.status_code != 200:
+            time.sleep(poll_interval)
+            continue
+        data = r.json()
+        ai_qs = data.get("ai_questions", [])
+        # 생성 완료 판단: 질문이 1개 이상 생겼고, 이전 폴링과 개수 동일 (더 이상 안 늘어남)
+        if len(ai_qs) > 0 and len(ai_qs) == prev_count:
+            log(f"  AI 질문 {len(ai_qs)}개 확인 (폴링)")
+            return ai_qs
+        prev_count = len(ai_qs)
+        time.sleep(poll_interval)
+    log(f"  AI 질문 폴링 타임아웃 ({max_wait}s) — 현재 {prev_count}개")
+    return []
 
 
 def step_submit_ai_answers(session, headers: dict, record_id: int, ai_questions: list, persona: str) -> None:
@@ -657,7 +646,7 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
             if r_check.status_code == 200:
                 total_ai = len(r_check.json().get("ai_questions", []))
                 if total_ai == 0:
-                    ai_questions = step_stream_ai_questions(session, token, record_id)
+                    ai_questions = step_poll_ai_questions(session, headers, record_id)
                     step_submit_ai_answers(session, headers, record_id, ai_questions, persona)
 
         log(f"  ✅ 보충 완료 — record={record_id}")
@@ -675,7 +664,7 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
         return False
 
     step_common_questions(session, headers, record_id)
-    ai_questions = step_stream_ai_questions(session, token, record_id)
+    ai_questions = step_poll_ai_questions(session, headers, record_id)
     step_submit_ai_answers(session, headers, record_id, ai_questions, persona)
 
     log(f"  ✅ 완료 — record={record_id} survey={survey_id} AI질문={len(ai_questions)}개")
