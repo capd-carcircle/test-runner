@@ -494,7 +494,7 @@ def step_create_record(session, headers: dict, target_date: str, vitals: dict) -
 
 
 def step_poll_ai_questions(session, headers: dict, record_id: int,
-                           poll_interval: int = 5, max_wait: int = 90) -> list:
+                           poll_interval: int = 5, max_wait: int = 45) -> list:
     """신규 기록 전용 — AI 질문 생성 대기 (최대 90s)"""
     deadline = time.time() + max_wait
     prev_count = 0
@@ -634,7 +634,7 @@ def execute_work_item(item: dict, password: str) -> bool:
             log(f"  AI 질문 미생성 → submit 재호출로 재트리거")
             api_post(session, f"/api/v1/records/{record_id}/submit", headers=headers)
             # 폴링으로 생성 대기
-            ai_questions = step_poll_ai_questions(session, headers, record_id, max_wait=90)
+            ai_questions = step_poll_ai_questions(session, headers, record_id, max_wait=45)
             if ai_questions:
                 unanswered = [q for q in ai_questions if not q.get("answered")]
                 if unanswered:
