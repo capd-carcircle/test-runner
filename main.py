@@ -15,7 +15,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 
 # ── 환경변수 ────────────────────────────────────────────────
@@ -306,8 +307,7 @@ def generate_ai_answers(ai_questions: list, persona: str) -> dict:
     if not ai_questions:
         return {}
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     questions_text = json.dumps(
         [{"question_id": q.get("question_id") or q.get("id"),
@@ -330,7 +330,7 @@ def generate_ai_answers(ai_questions: list, persona: str) -> dict:
 
     for attempt in range(GEMINI_MAX_RETRIES):
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
             raw = response.text.strip()
             match = re.search(r"\[.*\]", raw, re.DOTALL)
             if not match:
