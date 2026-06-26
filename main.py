@@ -443,30 +443,31 @@ def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: in
             log(f"  AI 질문 생성 실패: {r.status_code}")
             return 0
 
-        if r.status_code == 200:
-            data = r.json()
-            total = data.get("total", 0)
-            generated = data.get("generated", 0)
-            log(f"  AI 질문 생성 완료 — generated={generated}, total={total}")
-            return total
+        data = r.json()
 
-        # 202: BackgroundTasks — 생성 완료까지 polling (최대 60초)
-        log(f"  AI 질문 생성 중 (백그라운드) — 완료 대기...")
-        poll_url = f"{BASE}/api/v1/surveys/{record_id}/my-responses"
-        for attempt in range(12):  # 5초 간격 × 12 = 60초
-            time.sleep(5)
-            try:
-                pr = session.get(poll_url, headers=headers, timeout=15)
-                if pr.status_code == 200:
-                    data = pr.json()
-                    ai_qs = data.get("ai_questions", [])
-                    if ai_qs:
-                        log(f"  AI 질문 생성 완료 — total={len(ai_qs)}")
-                        return len(ai_qs)
-            except Exception:
-                pass
-        log(f"  AI 질문 생성 타임아웃 (60초)")
-        return 0
+        # "status": "generating" → BackgroundTasks 실행 중, polling 필요
+        if data.get("status") == "generating":
+            log(f"  AI 질문 생성 중 (백그라운드) — 완료 대기...")
+            poll_url = f"{BASE}/api/v1/surveys/{record_id}/my-responses"
+            for attempt in range(12):  # 5초 간격 × 12 = 60초
+                time.sleep(5)
+                try:
+                    pr = session.get(poll_url, headers=headers, timeout=15)
+                    if pr.status_code == 200:
+                        ai_qs = pr.json().get("ai_questions", [])
+                        if ai_qs:
+                            log(f"  AI 질문 생성 완료 — total={len(ai_qs)}")
+                            return len(ai_qs)
+                except Exception:
+                    pass
+            log(f"  AI 질문 생성 타임아웃 (60초)")
+            return 0
+
+        # total/generated 키 있는 응답 (이미 existing 있었던 경우)
+        total = data.get("total", 0)
+        generated = data.get("generated", 0)
+        log(f"  AI 질문 생성 완료 — generated={generated}, total={total}")
+        return total
     except Exception as e:
         log(f"  AI 질문 생성 예외: {e}")
         return 0
