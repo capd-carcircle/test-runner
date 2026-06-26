@@ -611,7 +611,7 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
     session = requests.Session()
     token = step_login(session, phone, password)
     if not token:
-        return False
+        return "skip"  # 로그인 실패 = 비밀번호 불일치 계정, 실패로 카운트 안 함
     headers = {"Authorization": f"Bearer {token}"}
 
     # ── 기존 기록 확인 ──
