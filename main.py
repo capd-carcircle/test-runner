@@ -433,20 +433,40 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
 def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: int = 120) -> int:
     """
     비스트리밍 AI 질문 생성 엔드포인트 호출.
+    202(BackgroundTasks) 또는 200 모두 처리 — 생성 완료까지 polling.
     생성된 질문 수 반환 (실패 시 0).
     """
     url = f"{BASE}/api/v1/surveys/{record_id}/ai-questions/generate"
     try:
         r = session.post(url, headers=headers, timeout=timeout)
+        if r.status_code not in (200, 202):
+            log(f"  AI 질문 생성 실패: {r.status_code}")
+            return 0
+
         if r.status_code == 200:
             data = r.json()
             total = data.get("total", 0)
             generated = data.get("generated", 0)
             log(f"  AI 질문 생성 완료 — generated={generated}, total={total}")
             return total
-        else:
-            log(f"  AI 질문 생성 실패: {r.status_code}")
-            return 0
+
+        # 202: BackgroundTasks — 생성 완료까지 polling (최대 60초)
+        log(f"  AI 질문 생성 중 (백그라운드) — 완료 대기...")
+        poll_url = f"{BASE}/api/v1/surveys/{record_id}/my-responses"
+        for attempt in range(12):  # 5초 간격 × 12 = 60초
+            time.sleep(5)
+            try:
+                pr = session.get(poll_url, headers=headers, timeout=15)
+                if pr.status_code == 200:
+                    data = pr.json()
+                    ai_qs = data.get("ai_questions", [])
+                    if ai_qs:
+                        log(f"  AI 질문 생성 완료 — total={len(ai_qs)}")
+                        return len(ai_qs)
+            except Exception:
+                pass
+        log(f"  AI 질문 생성 타임아웃 (60초)")
+        return 0
     except Exception as e:
         log(f"  AI 질문 생성 예외: {e}")
         return 0
