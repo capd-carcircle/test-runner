@@ -430,47 +430,26 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
     log(f"  공통 질문 {len(responses)}개 제출: {r.status_code}")
 
 
-def step_trigger_ai_via_sse(token: str, record_id: int, timeout: int = 120) -> list:
+def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: int = 120) -> int:
     """
-    SSE 엔드포인트를 직접 호출해 AI 질문 생성 트리거 + 결과 수집.
-    생성된 질문 목록 반환 (실패 시 빈 리스트).
+    비스트리밍 AI 질문 생성 엔드포인트 호출.
+    생성된 질문 수 반환 (실패 시 0).
     """
-    url = f"{BASE}/api/v1/surveys/{record_id}/ai-questions/stream"
-    questions = []
+    url = f"{BASE}/api/v1/surveys/{record_id}/ai-questions/generate"
     try:
-        with requests.get(url, params={"token": token}, stream=True, timeout=timeout) as r:
-            if r.status_code != 200:
-                log(f"  SSE 호출 실패: {r.status_code}")
-                return []
-            buffer = ""
-            event_type = "message"
-            for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
-                buffer += chunk
-                while "\n\n" in buffer:
-                    event_block, buffer = buffer.split("\n\n", 1)
-                    lines = event_block.strip().splitlines()
-                    data_str = None
-                    for line in lines:
-                        if line.startswith("event:"):
-                            event_type = line[6:].strip()
-                        elif line.startswith("data:"):
-                            data_str = line[5:].strip()
-                    if event_type == "done":
-                        log(f"  SSE 완료 — AI 질문 {len(questions)}개 생성")
-                        return questions
-                    if data_str:
-                        try:
-                            q = json.loads(data_str)
-                            if "question_id" in q:
-                                questions.append(q)
-                        except Exception:
-                            pass
-                    event_type = "message"
-    except requests.exceptions.Timeout:
-        log(f"  SSE {timeout}s 타임아웃 — {len(questions)}개 수신")
+        r = session.post(url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            total = data.get("total", 0)
+            generated = data.get("generated", 0)
+            log(f"  AI 질문 생성 완료 — generated={generated}, total={total}")
+            return total
+        else:
+            log(f"  AI 질문 생성 실패: {r.status_code}")
+            return 0
     except Exception as e:
-        log(f"  SSE 예외: {e}")
-    return questions
+        log(f"  AI 질문 생성 예외: {e}")
+        return 0
 
 
 def step_fill_ai(session, headers: dict, record_id: int, unanswered: list, persona: str) -> None:
@@ -629,30 +608,21 @@ def execute_work_item(item: dict, password: str) -> bool:
     if state and state["unanswered_common"]:
         step_fill_common(session, headers, record_id, state["unanswered_common"])
 
-    # 4. AI 질문 — 없으면 SSE로 생성, 있으면 미답변 답변
+    # 4. AI 질문 — 비스트리밍 생성 후 답변
     state = step_get_survey_state(session, headers, record_id)
     if not state:
         log(f"  ✅ [{phone}] {target_date} 완료 (record={record_id})")
         return True
 
     if state["ai_total"] == 0:
-        log(f"  AI 질문 없음 → SSE 생성 트리거")
-        ai_questions = step_trigger_ai_via_sse(token, record_id)
-        if not ai_questions:
-            # SSE 타임아웃 시 백그라운드 생성 대기 후 폴링
-            log(f"  SSE 미수신 → 60초 대기 후 폴링")
-            time.sleep(60)
-            state2 = step_get_survey_state(session, headers, record_id)
-            if state2 and state2["unanswered_ai"]:
-                step_fill_ai(session, headers, record_id, state2["unanswered_ai"], persona)
-            elif state2 and state2["ai_total"] == 0:
-                log(f"  AI 질문 미생성 — 건너뜀")
+        log(f"  AI 질문 없음 → 생성 요청")
+        total = step_trigger_ai_generate(session, headers, record_id)
+        if total > 0:
+            state = step_get_survey_state(session, headers, record_id)
         else:
-            unanswered_ai = [q for q in ai_questions
-                             if not q.get("existing_choice") and not q.get("existing_text_answer")]
-            if unanswered_ai:
-                step_fill_ai(session, headers, record_id, unanswered_ai, persona)
-    elif state["unanswered_ai"]:
+            log(f"  AI 질문 미생성 — 건너뜀")
+
+    if state and state["unanswered_ai"]:
         step_fill_ai(session, headers, record_id, state["unanswered_ai"], persona)
 
     log(f"  ✅ [{phone}] {target_date} 완료 (record={record_id})")
