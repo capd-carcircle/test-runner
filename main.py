@@ -638,10 +638,20 @@ def execute_work_item(item: dict, password: str) -> bool:
     if state["ai_total"] == 0:
         log(f"  AI 질문 없음 → SSE 생성 트리거")
         ai_questions = step_trigger_ai_via_sse(token, record_id)
-        unanswered_ai = [q for q in ai_questions
-                         if not q.get("existing_choice") and not q.get("existing_text_answer")]
-        if unanswered_ai:
-            step_fill_ai(session, headers, record_id, unanswered_ai, persona)
+        if not ai_questions:
+            # SSE 타임아웃 시 백그라운드 생성 대기 후 폴링
+            log(f"  SSE 미수신 → 60초 대기 후 폴링")
+            time.sleep(60)
+            state2 = step_get_survey_state(session, headers, record_id)
+            if state2 and state2["unanswered_ai"]:
+                step_fill_ai(session, headers, record_id, state2["unanswered_ai"], persona)
+            elif state2 and state2["ai_total"] == 0:
+                log(f"  AI 질문 미생성 — 건너뜀")
+        else:
+            unanswered_ai = [q for q in ai_questions
+                             if not q.get("existing_choice") and not q.get("existing_text_answer")]
+            if unanswered_ai:
+                step_fill_ai(session, headers, record_id, unanswered_ai, persona)
     elif state["unanswered_ai"]:
         step_fill_ai(session, headers, record_id, state["unanswered_ai"], persona)
 
