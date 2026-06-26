@@ -15,15 +15,15 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import google.generativeai as genai
 import requests
-import vertexai
-from vertexai.generative_models import GenerativeModel
 
 # ── 환경변수 ────────────────────────────────────────────────
 BASE          = os.environ.get("BACKEND_URL",    "https://capd-backend-675812688902.asia-northeast3.run.app")
 GCP_PROJECT   = os.environ.get("GCP_PROJECT_ID", "capd-carcircle-dev")
 GCP_REGION    = os.environ.get("GCP_REGION",     "asia-northeast3")
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL",   "gemini-2.5-flash")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TEST_PASSWORD = os.environ.get("TEST_PASSWORD",  "TestCapd2025!")
 DATABASE_URL  = os.environ.get("DATABASE_URL",   "")
 BACKFILL_START = os.environ.get("BACKFILL_START", "").strip()
@@ -306,8 +306,8 @@ def generate_ai_answers(ai_questions: list, persona: str) -> dict:
     if not ai_questions:
         return {}
 
-    vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
-    model = GenerativeModel(GEMINI_MODEL)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
 
     questions_text = json.dumps(
         [{"question_id": q.get("question_id") or q.get("id"),
