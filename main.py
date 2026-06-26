@@ -19,8 +19,8 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 
 # ── 환경변수 ────────────────────────────────────────────────
-BASE          = os.environ.get("BACKEND_URL",    "https://capd-backend-cdwaxwdxfa-du.a.run.app")
-GCP_PROJECT   = os.environ.get("GCP_PROJECT_ID", "skuniv-training-2")
+BASE          = os.environ.get("BACKEND_URL",    "https://capd-backend-675812688902.asia-northeast3.run.app")
+GCP_PROJECT   = os.environ.get("GCP_PROJECT_ID", "capd-carcircle-dev")
 GCP_REGION    = os.environ.get("GCP_REGION",     "asia-northeast3")
 GEMINI_MODEL  = os.environ.get("GEMINI_MODEL",   "gemini-2.5-flash")
 TEST_PASSWORD = os.environ.get("TEST_PASSWORD",  "TestCapd2025!")
