@@ -1,8 +1,9 @@
 """
-CAPD 자동 테스트 러너 v3
+CAPD 자동 테스트 러너 v4
 - 기본: DB의 모든 환자에 대해 오늘 날짜 기록 생성
 - 백필: BACKFILL_START / BACKFILL_END 환경변수로 날짜 범위 지정
 - 환자별 임상 프로필 적용 (수치 범위 + Gemini 답변 프롬프트)
+- 쿼터 보호: ThreadPoolExecutor 병렬처리 + Gemini 세마포어 + 지수 백오프
 """
 
 import json
@@ -11,6 +12,9 @@ import os
 import random
 import re
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -28,6 +32,16 @@ DATABASE_URL  = os.environ.get("DATABASE_URL",   "")
 BACKFILL_START = os.environ.get("BACKFILL_START", "").strip()
 BACKFILL_END   = os.environ.get("BACKFILL_END",   "").strip()
 DATE_OVERRIDE  = os.environ.get("DATE_OVERRIDE",  "").strip()
+
+# 동시 환자 처리 수 (기본 5) — 늘릴수록 빠르지만 백엔드 부하 증가
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "5"))
+# Gemini 동시 호출 제한 — RPM 보호 (기본 3)
+GEMINI_CONCURRENCY = int(os.environ.get("GEMINI_CONCURRENCY", "3"))
+# Gemini 재시도 최대 횟수
+GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "4"))
+
+# Gemini 동시 호출 세마포어 (모듈 레벨 공유)
+_gemini_sem = threading.Semaphore(GEMINI_CONCURRENCY)
 
 # ── KST 오늘 날짜 ────────────────────────────────────────────
 KST = ZoneInfo("Asia/Seoul")
@@ -335,44 +349,55 @@ def api_post(session, path, **kwargs):
     return session.post(f"{BASE}{path}", **kwargs)
 
 
-# ── Gemini 답변 생성 ─────────────────────────────────────────
+# ── Gemini 답변 생성 (지수 백오프 재시도) ────────────────────
 def generate_ai_answers(ai_questions: list, persona: str) -> dict:
     if not ai_questions:
         return {}
-    try:
-        vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
-        model = GenerativeModel(GEMINI_MODEL)
 
-        questions_text = json.dumps(
-            [{"question_id": q.get("question_id") or q.get("id"),
-              "question_text": q.get("question_text", ""),
-              "question_type": q.get("question_type", "short_text"),
-              "options": q.get("options")}
-             for q in ai_questions],
-            ensure_ascii=False,
-        )
+    vertexai.init(project=GCP_PROJECT, location=GCP_REGION)
+    model = GenerativeModel(GEMINI_MODEL)
 
-        prompt = (
-            f"{persona}\n\n"
-            "아래 질문 목록을 읽고 위 환자 상태에 맞게 사실적으로 답변해주세요.\n"
-            "규칙:\n"
-            "- question_type이 yes_no이면 환자 상태에 맞게 'yes' 또는 'no'로만 답하세요\n"
-            "- short_text이면 1~2문장 한국어 구어체로 이 환자답게 구체적으로 답하세요\n"
-            "- 반드시 JSON 배열만 반환하고 다른 텍스트는 절대 쓰지 마세요\n"
-            '형식: [{"question_id": 숫자, "answer": "답변"}, ...]\n\n'
-            f"질문 목록:\n{questions_text}"
-        )
+    questions_text = json.dumps(
+        [{"question_id": q.get("question_id") or q.get("id"),
+          "question_text": q.get("question_text", ""),
+          "question_type": q.get("question_type", "short_text"),
+          "options": q.get("options")}
+         for q in ai_questions],
+        ensure_ascii=False,
+    )
+    prompt = (
+        f"{persona}\n\n"
+        "아래 질문 목록을 읽고 위 환자 상태에 맞게 사실적으로 답변해주세요.\n"
+        "규칙:\n"
+        "- question_type이 yes_no이면 환자 상태에 맞게 'yes' 또는 'no'로만 답하세요\n"
+        "- short_text이면 1~2문장 한국어 구어체로 이 환자답게 구체적으로 답하세요\n"
+        "- 반드시 JSON 배열만 반환하고 다른 텍스트는 절대 쓰지 마세요\n"
+        '형식: [{"question_id": 숫자, "answer": "답변"}, ...]\n\n'
+        f"질문 목록:\n{questions_text}"
+    )
 
-        response = model.generate_content(prompt)
-        raw = response.text.strip()
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not match:
-            return {}
-        parsed = json.loads(match.group())
-        return {str(item["question_id"]): str(item["answer"])
-                for item in parsed if "question_id" in item and "answer" in item}
-    except Exception as e:
-        log(f"  Gemini 실패 (fallback): {e}")
+    with _gemini_sem:  # 동시 Gemini 호출 제한
+        for attempt in range(GEMINI_MAX_RETRIES):
+            try:
+                response = model.generate_content(prompt)
+                raw = response.text.strip()
+                match = re.search(r"\[.*\]", raw, re.DOTALL)
+                if not match:
+                    return {}
+                parsed = json.loads(match.group())
+                return {str(item["question_id"]): str(item["answer"])
+                        for item in parsed if "question_id" in item and "answer" in item}
+            except Exception as e:
+                err_str = str(e)
+                # 429 ResourceExhausted / 503 Unavailable → 재시도
+                if any(code in err_str for code in ("429", "503", "ResourceExhausted", "RESOURCE_EXHAUSTED")):
+                    wait = (2 ** attempt) * 10 + random.uniform(0, 3)  # 10s, 20s, 40s, 80s
+                    log(f"  Gemini 쿼터 초과 (시도 {attempt+1}/{GEMINI_MAX_RETRIES}) — {wait:.0f}초 대기")
+                    time.sleep(wait)
+                else:
+                    log(f"  Gemini 실패 (fallback): {e}")
+                    return {}
+        log("  Gemini 최대 재시도 초과 — fallback 반환")
         return {}
 
 
@@ -573,33 +598,57 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
     return True
 
 
-# ── 메인 ────────────────────────────────────────────────────
-def main():
-    dates    = get_date_range()
-    phones   = get_all_patient_phones()
-    password = TEST_PASSWORD
+# ── 날짜 1일치 병렬 처리 ─────────────────────────────────────
+def run_date(target_date: str, phones: list, password: str) -> tuple[int, int, int]:
+    """(ok, skip, fail) 반환"""
+    ok = fail = skip = 0
+    lock = threading.Lock()
 
-    log(f"=== CAPD 테스트 러너 v3 시작 ===")
-    log(f"  환자: {len(phones)}명, 날짜: {dates[0]} ~ {dates[-1]} ({len(dates)}일)")
-
-    total = ok = fail = skip = 0
-
-    for target_date in dates:
-        log(f"\n── {target_date} ──")
-        for phone in phones:
-            total += 1
-            log(f"  [{phone}] 시작")
-            try:
-                result = run_one(phone, password, target_date)
+    def _task(phone):
+        nonlocal ok, fail, skip
+        log(f"  [{phone}] 시작 ({target_date})")
+        try:
+            result = run_one(phone, password, target_date)
+            with lock:
                 if result == "skip":
                     skip += 1
                 elif result:
                     ok += 1
                 else:
                     fail += 1
-            except Exception as exc:
-                log(f"  [{phone}] 예외: {exc}")
+        except Exception as exc:
+            log(f"  [{phone}] 예외: {exc}")
+            with lock:
                 fail += 1
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(_task, p): p for p in phones}
+        for f in as_completed(futures):
+            f.result()  # 예외 전파 방지 (이미 내부에서 처리)
+
+    return ok, skip, fail
+
+
+# ── 메인 ────────────────────────────────────────────────────
+def main():
+    dates    = get_date_range()
+    phones   = get_all_patient_phones()
+    password = TEST_PASSWORD
+
+    log(f"=== CAPD 테스트 러너 v4 시작 ===")
+    log(f"  환자: {len(phones)}명 | 날짜: {dates[0]} ~ {dates[-1]} ({len(dates)}일)")
+    log(f"  병렬처리: MAX_WORKERS={MAX_WORKERS} | Gemini 동시제한: {GEMINI_CONCURRENCY}")
+
+    total = ok = fail = skip = 0
+
+    for target_date in dates:
+        log(f"\n── {target_date} ──")
+        d_ok, d_skip, d_fail = run_date(target_date, phones, password)
+        ok   += d_ok
+        skip += d_skip
+        fail += d_fail
+        total += len(phones)
+        log(f"  [{target_date}] 완료 — 성공={d_ok} 스킵={d_skip} 실패={d_fail}")
 
     log(f"\n=== 완료 === 성공={ok} 건너뜀={skip} 실패={fail} 전체={total}")
     if fail > 0:
