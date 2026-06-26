@@ -402,7 +402,8 @@ def step_submit_record(session, headers: dict, record_id: int) -> int | None:
     r2 = api_get(session, f"/api/v1/surveys?record_id={record_id}", headers=headers)
     if r2.status_code == 200 and r2.json():
         return r2.json()[0]["id"]
-    return None
+    # survey 조회 실패해도 record_id 자체는 있으므로 -1 반환 (실패 아님)
+    return -1
 
 
 def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -> None:
@@ -413,12 +414,15 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
     for q in unanswered:
         qt   = q.get("question_type", "short_text")
         text = q.get("question_text", "")
+        qid = q.get("question_id") or q.get("id")
+        if not qid:
+            continue
         if qt == "yes_no":
             choice = "yes" if any(kw in text for kw in YES_KEYWORDS) else "no"
-            responses.append({"question_id": q["question_id"], "question_type": "common",
+            responses.append({"question_id": qid, "question_type": "common",
                                "choice": choice, "text_answer": ""})
         else:
-            responses.append({"question_id": q["question_id"], "question_type": "common",
+            responses.append({"question_id": qid, "question_type": "common",
                                "choice": None, "text_answer": "특이사항 없음"})
     r = api_post(session, f"/api/v1/surveys/{record_id}/common",
                  json={"record_id": record_id, "responses": responses}, headers=headers)
