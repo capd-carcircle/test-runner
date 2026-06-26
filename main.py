@@ -439,31 +439,10 @@ def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: in
     url = f"{BASE}/api/v1/surveys/{record_id}/ai-questions/generate"
     try:
         r = session.post(url, headers=headers, timeout=timeout)
-        if r.status_code not in (200, 202):
+        if r.status_code != 200:
             log(f"  AI 질문 생성 실패: {r.status_code}")
             return 0
-
         data = r.json()
-
-        # "status": "generating" → BackgroundTasks 실행 중, polling 필요
-        if data.get("status") == "generating":
-            log(f"  AI 질문 생성 중 (백그라운드) — 완료 대기...")
-            poll_url = f"{BASE}/api/v1/surveys/{record_id}/my-responses"
-            for attempt in range(12):  # 5초 간격 × 12 = 60초
-                time.sleep(5)
-                try:
-                    pr = session.get(poll_url, headers=headers, timeout=15)
-                    if pr.status_code == 200:
-                        ai_qs = pr.json().get("ai_questions", [])
-                        if ai_qs:
-                            log(f"  AI 질문 생성 완료 — total={len(ai_qs)}")
-                            return len(ai_qs)
-                except Exception:
-                    pass
-            log(f"  AI 질문 생성 타임아웃 (60초)")
-            return 0
-
-        # total/generated 키 있는 응답 (이미 existing 있었던 경우)
         total = data.get("total", 0)
         generated = data.get("generated", 0)
         log(f"  AI 질문 생성 완료 — generated={generated}, total={total}")
