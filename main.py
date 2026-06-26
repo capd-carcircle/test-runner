@@ -493,25 +493,6 @@ def step_create_record(session, headers: dict, target_date: str, vitals: dict) -
     return None
 
 
-def step_poll_ai_questions(session, headers: dict, record_id: int,
-                           poll_interval: int = 5, max_wait: int = 45) -> list:
-    """신규 기록 전용 — AI 질문 생성 대기 (최대 90s)"""
-    deadline = time.time() + max_wait
-    prev_count = 0
-    while time.time() < deadline:
-        r = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
-        if r.status_code != 200:
-            time.sleep(poll_interval)
-            continue
-        ai_qs = r.json().get("ai_questions", [])
-        if len(ai_qs) > 0 and len(ai_qs) == prev_count:
-            log(f"  AI 질문 {len(ai_qs)}개 생성 확인")
-            return ai_qs
-        prev_count = len(ai_qs)
-        time.sleep(poll_interval)
-    log(f"  AI 질문 폴링 {max_wait}s 타임아웃 — {prev_count}개")
-    return []
-
 
 # ── Phase 1: 환자별 스캔 ─────────────────────────────────────
 def scan_patient(phone: str, password: str, dates: list[str]) -> list[dict]:
@@ -596,12 +577,10 @@ def execute_work_item(item: dict, password: str) -> bool:
         if state and state["unanswered_common"]:
             step_fill_common(session, headers, record_id, state["unanswered_common"])
 
-        # AI 질문 — 신규이므로 폴링
-        ai_questions = step_poll_ai_questions(session, headers, record_id)
-        if ai_questions:
-            unanswered = [q for q in ai_questions if not q.get("answered")]
-            if unanswered:
-                step_fill_ai(session, headers, record_id, unanswered, persona)
+        # AI 질문 — 생성된 게 있으면 답변, 없으면 스킵 (폴링 없음)
+        state2 = step_get_survey_state(session, headers, record_id)
+        if state2 and state2["unanswered_ai"]:
+            step_fill_ai(session, headers, record_id, state2["unanswered_ai"], persona)
 
         log(f"  ✅ [{phone}] {target_date} 신규 완료 (record={record_id})")
         return True
@@ -630,17 +609,7 @@ def execute_work_item(item: dict, password: str) -> bool:
         if missing_ai:
             step_fill_ai(session, headers, record_id, missing_ai, persona)
         elif ai_total == 0:
-            # AI 질문이 아예 없음 → submit 재호출로 백그라운드 생성 재트리거
-            log(f"  AI 질문 미생성 → submit 재호출로 재트리거")
-            api_post(session, f"/api/v1/records/{record_id}/submit", headers=headers)
-            # 폴링으로 생성 대기
-            ai_questions = step_poll_ai_questions(session, headers, record_id, max_wait=45)
-            if ai_questions:
-                unanswered = [q for q in ai_questions if not q.get("answered")]
-                if unanswered:
-                    step_fill_ai(session, headers, record_id, unanswered, persona)
-            else:
-                log(f"  AI 질문 생성 실패 — 기록 완료 처리")
+            log(f"  AI 질문 미생성 — 스킵")
 
         log(f"  ✅ [{phone}] {target_date} 보충 완료 (record={record_id},"
             f" common={len(missing_common)}, ai={len(missing_ai)})")
