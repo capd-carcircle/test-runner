@@ -410,16 +410,64 @@ def step_login(session, phone: str, password: str) -> str | None:
     return r.json()["access_token"]
 
 
-def step_check_existing(session, headers: dict, target_date: str) -> bool:
+def step_get_existing(session, headers: dict, target_date: str) -> tuple[int | None, str | None]:
+    """기존 기록 반환 (record_id, status). 없으면 (None, None)"""
     r = api_get(session, f"/api/v1/records?date={target_date}", headers=headers)
     if r.status_code == 200:
         existing = r.json()
         if isinstance(existing, list) and existing:
             first = existing[0]
-            if first.get("status") in ("submitted", "reviewed"):
-                log(f"  [{target_date}] 이미 완료 (id={first['id']}) — 스킵")
-                return True
-    return False
+            return first.get("id"), first.get("status")
+    return None, None
+
+
+def step_get_unanswered(session, headers: dict, record_id: int) -> tuple[list, list]:
+    """미답변 공통질문, 미답변 AI질문 반환"""
+    r = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
+    if r.status_code != 200:
+        return [], []
+    data = r.json()
+    unanswered_common = [q for q in data.get("common_questions", []) if not q.get("answered")]
+    unanswered_ai    = [q for q in data.get("ai_questions", [])     if not q.get("answered")]
+    return unanswered_common, unanswered_ai
+
+
+def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -> None:
+    if not unanswered:
+        return
+    YES_KEYWORDS = ["처방약", "약을 복용", "약 복용", "복약"]
+    responses = []
+    for q in unanswered:
+        qt   = q.get("question_type", "short_text")
+        text = q.get("question_text", "")
+        if qt == "yes_no":
+            choice = "yes" if any(kw in text for kw in YES_KEYWORDS) else "no"
+            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": choice, "text_answer": ""})
+        else:
+            responses.append({"question_id": q["question_id"], "question_type": "common", "choice": None, "text_answer": "특이사항 없음"})
+    r = api_post(session, f"/api/v1/surveys/{record_id}/common",
+                 json={"record_id": record_id, "responses": responses}, headers=headers)
+    log(f"  공통 질문 보충 {len(responses)}개: {r.status_code}")
+
+
+def step_fill_ai(session, headers: dict, record_id: int, unanswered: list, persona: str) -> None:
+    if not unanswered:
+        return
+    gemini_answers = generate_ai_answers(unanswered, persona)
+    ai_responses = []
+    for q in unanswered:
+        qt  = q.get("question_type", "short_text")
+        qid = q.get("question_id") or q.get("id")
+        ans = gemini_answers.get(str(qid))
+        if qt == "yes_no":
+            choice = ans if ans in ("yes", "no") else "no"
+            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": choice, "text_answer": ""})
+        else:
+            ai_responses.append({"question_id": qid, "question_type": "ai", "choice": None,
+                                  "text_answer": ans if ans else "특별한 증상 없이 평소와 비슷합니다."})
+    r = api_post(session, f"/api/v1/surveys/{record_id}/ai",
+                 json={"record_id": record_id, "responses": ai_responses}, headers=headers)
+    log(f"  AI 답변 보충 {len(ai_responses)}개: {r.status_code}")
 
 
 def step_create_record(session, headers: dict, target_date: str, vitals: dict) -> int | None:
@@ -577,9 +625,45 @@ def run_one(phone: str, password: str, target_date: str) -> bool:
         return False
     headers = {"Authorization": f"Bearer {token}"}
 
-    if step_check_existing(session, headers, target_date):
+    # ── 기존 기록 확인 ──
+    record_id, status = step_get_existing(session, headers, target_date)
+
+    if status == "reviewed":
+        log(f"  [{target_date}] 의사 검토 완료 — 스킵")
         return True
 
+    if record_id and status in ("submitted", "draft"):
+        # 제출됐지만 survey 미완료일 수 있음 → 확인 후 보충
+        log(f"  [{target_date}] 기존 기록 있음 (id={record_id}, status={status}) — survey 확인")
+
+        # draft면 먼저 제출
+        if status == "draft":
+            survey_id = step_submit_record(session, headers, record_id)
+            if survey_id is None:
+                return False
+
+        unanswered_common, unanswered_ai = step_get_unanswered(session, headers, record_id)
+
+        # 공통 질문 보충
+        if unanswered_common:
+            step_fill_common(session, headers, record_id, unanswered_common)
+
+        # AI 질문 보충 — 이미 생성된 게 있으면 답변, 없으면 SSE로 대기
+        if unanswered_ai:
+            step_fill_ai(session, headers, record_id, unanswered_ai, persona)
+        elif not unanswered_ai:
+            # AI 질문 자체가 아예 없는 경우 SSE로 새로 받기
+            r_check = api_get(session, f"/api/v1/surveys/my-responses/{record_id}", headers=headers)
+            if r_check.status_code == 200:
+                total_ai = len(r_check.json().get("ai_questions", []))
+                if total_ai == 0:
+                    ai_questions = step_stream_ai_questions(session, token, record_id)
+                    step_submit_ai_answers(session, headers, record_id, ai_questions, persona)
+
+        log(f"  ✅ 보충 완료 — record={record_id}")
+        return True
+
+    # ── 신규 기록 생성 ──
     record_id = step_create_record(session, headers, target_date, vitals)
     if record_id is None:
         return False
