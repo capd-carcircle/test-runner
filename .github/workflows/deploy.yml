@@ -5,9 +5,9 @@ on:
     branches: [main]
 
 env:
-  PROJECT_ID: skuniv-training-2
+  PROJECT_ID: capd-carcircle-dev
   REGION: asia-northeast3
-  IMAGE: asia-northeast3-docker.pkg.dev/skuniv-training-2/capd/test-runner
+  IMAGE: asia-northeast3-docker.pkg.dev/capd-carcircle-dev/capd/test-runner
   JOB_NAME: capd-test-runner
 
 jobs:
@@ -38,9 +38,22 @@ jobs:
           docker push ${{ env.IMAGE }}:${{ github.sha }}
           docker push ${{ env.IMAGE }}:latest
 
-      - name: Update Cloud Run Job
+      - name: Deploy Cloud Run Job (create or update)
         run: |
-          gcloud run jobs update ${{ env.JOB_NAME }} \
-            --image ${{ env.IMAGE }}:${{ github.sha }} \
-            --region ${{ env.REGION }} \
-            --project ${{ env.PROJECT_ID }}
+          if gcloud run jobs describe ${{ env.JOB_NAME }} \
+              --region ${{ env.REGION }} \
+              --project ${{ env.PROJECT_ID }} > /dev/null 2>&1; then
+            gcloud run jobs update ${{ env.JOB_NAME }} \
+              --image ${{ env.IMAGE }}:${{ github.sha }} \
+              --region ${{ env.REGION }} \
+              --project ${{ env.PROJECT_ID }} \
+              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,PATIENT_DELAY_SEC=5,GEMINI_MAX_RETRIES=4"
+          else
+            gcloud run jobs create ${{ env.JOB_NAME }} \
+              --image ${{ env.IMAGE }}:${{ github.sha }} \
+              --region ${{ env.REGION }} \
+              --project ${{ env.PROJECT_ID }} \
+              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,PATIENT_DELAY_SEC=5,GEMINI_MAX_RETRIES=4" \
+              --max-retries 1 \
+              --task-timeout 900
+          fi
