@@ -430,7 +430,7 @@ def step_fill_common(session, headers: dict, record_id: int, unanswered: list) -
     log(f"  공통 질문 {len(responses)}개 제출: {r.status_code}")
 
 
-def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: int = 600) -> int:
+def step_trigger_ai_generate(session, headers: dict, record_id: int, timeout: int = 1800) -> int:
     """
     비스트리밍 AI 질문 생성 엔드포인트 호출.
     202(BackgroundTasks) 또는 200 모두 처리 — 생성 완료까지 polling.
