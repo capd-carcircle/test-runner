@@ -48,13 +48,13 @@ jobs:
               --region ${{ env.REGION }} \
               --project ${{ env.PROJECT_ID }} \
               --task-timeout 1800 \
-              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,GEMINI_MAX_RETRIES=4,GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,GEMINI_MAX_RETRIES=4,GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}"
           else
             gcloud run jobs create ${{ env.JOB_NAME }} \
               --image ${{ env.IMAGE }}:${{ github.sha }} \
               --region ${{ env.REGION }} \
               --project ${{ env.PROJECT_ID }} \
-              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,GEMINI_MAX_RETRIES=4,GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" \
+              --set-env-vars "DATABASE_URL=${{ secrets.DATABASE_URL }},BACKEND_URL=${{ secrets.BACKEND_URL }},TEST_PASSWORD=${{ secrets.TEST_PASSWORD }},GCP_PROJECT_ID=${{ env.PROJECT_ID }},GCP_REGION=${{ env.REGION }},GEMINI_MODEL=gemini-2.5-flash,GEMINI_MAX_RETRIES=4,GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}" \
               --max-retries 1 \
               --task-timeout 1800
           fi

@@ -30,6 +30,7 @@ DATABASE_URL  = os.environ.get("DATABASE_URL",   "")
 BACKFILL_START = os.environ.get("BACKFILL_START", "").strip()
 BACKFILL_END   = os.environ.get("BACKFILL_END",   "").strip()
 DATE_OVERRIDE  = os.environ.get("DATE_OVERRIDE",  "").strip()
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
 GEMINI_MAX_RETRIES = int(os.environ.get("GEMINI_MAX_RETRIES", "4"))
 
@@ -645,6 +646,71 @@ def preflight_login(phones: list, password: str) -> list:
     return valid
 
 
+# ── 재발 방지: AI 요약 폴백 감지 ──────────────────────────────
+def check_ai_summary_fallback(dates: list[str]) -> list[dict]:
+    """
+    이번 실행에서 다룬 날짜들 중 emr_soap가 빈 값('')인 submitted/reviewed 기록을 찾는다.
+
+    ai/agents/summary_agent.py의 _fallback_triage()는 예외 발생 시 항상 emr_soap=''로
+    저장하고, 정상 Gemini 성공 경로는 항상 비어있지 않은 SOAP 문자열을 반환한다.
+    즉 이 마커 하나만으로 "/summary가 200 OK를 반환했더라도 내부적으로는 폴백 중이었는지"를
+    감지할 수 있다 — 2026-07-07에 발견된 get_gemini_model NameError 버그가 바로 이 패턴으로
+    11일간 안 걸렸음(Job 성공 여부만 봐서 폴백 콘텐츠는 아무도 확인 안 함). 같은 종류의
+    버그가 재발하면 이 체크가 잡는다.
+    """
+    if not DATABASE_URL:
+        log("  DATABASE_URL 미설정 — 폴백 감지 스킵")
+        return []
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT u.name, dr.record_date
+            FROM daily_records dr
+            JOIN users u ON u.id = dr.patient_id
+            WHERE dr.record_date = ANY(%s::date[])
+              AND dr.status IN ('submitted', 'reviewed')
+              AND (dr.emr_soap IS NULL OR dr.emr_soap = '')
+            ORDER BY dr.record_date, u.name
+            """,
+            (dates,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"patient_name": r[0], "record_date": r[1].isoformat()} for r in rows]
+    except Exception as e:
+        log(f"  폴백 감지 쿼리 실패: {e}")
+        return []
+
+
+def send_fallback_alert(fallback_records: list[dict]) -> None:
+    if not fallback_records:
+        log("  AI 요약 폴백 감지: 없음 (정상)")
+        return
+
+    lines = [f"⚠️ CAPD 테스트 러너 — AI 요약 폴백 감지 {len(fallback_records)}건"]
+    lines.append("emr_soap가 빈 값으로 저장됨 — summary_agent가 예외로 폴백 트리아지 중일 수 있음. capd-ai 로그 확인 필요.")
+    for r in fallback_records[:20]:
+        lines.append(f"• {r['patient_name']} — {r['record_date']}")
+    if len(fallback_records) > 20:
+        lines.append(f"...외 {len(fallback_records) - 20}건")
+    text = "\n".join(lines)
+
+    log(f"  {text}")
+    if not SLACK_WEBHOOK_URL:
+        log("  SLACK_WEBHOOK_URL 미설정 — Slack 전송 생략")
+        return
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        if resp.status_code != 200:
+            log(f"  Slack 전송 실패: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        log(f"  Slack 전송 예외: {e}")
+
+
 # ── 메인 ────────────────────────────────────────────────────
 def main():
     dates    = get_date_range()
@@ -674,6 +740,12 @@ def main():
 
     if not all_work:
         log("모든 기록 완료 — 작업 없음")
+        # 이번 실행이 건드릴 건 없었지만, 이전에 이미 처리된 오늘자 기록이 폴백 상태로
+        # 남아있을 수 있으니(예: 수동 재실행 사이 구간) 그래도 감지는 수행.
+        fallback = check_ai_summary_fallback(dates)
+        send_fallback_alert(fallback)
+        if fallback:
+            sys.exit(1)
         return
 
     # ── Phase 2: 실행 (직렬, 항목 간 2초 간격) ──
@@ -693,7 +765,13 @@ def main():
         time.sleep(2)  # 백엔드/AI 서비스 부하 방지
 
     log(f"\n=== 완료 === 성공={ok} 실패={fail} 전체={len(all_work)}")
-    if fail > 0:
+
+    # ── Phase 3: 재발 방지 — AI 요약 폴백 감지 ──
+    log(f"\n=== Phase 3: AI 요약 폴백 감지 ===")
+    fallback = check_ai_summary_fallback(dates)
+    send_fallback_alert(fallback)
+
+    if fail > 0 or fallback:
         sys.exit(1)
 
 
